@@ -500,22 +500,7 @@ def _render_methodology(
         rejects it.
         """
     )
-    if use_regime_filters:
-        st.markdown(
-            """
-            The Regime filters operate as conflict vetoes:
-
-            - For directional-duration trades, SPY, VIX, available credit spreads, the broad dollar and
-              inflation breakevens form a duration-regime score. A risk-on/inflation-up score favors short
-              duration; a risk-off/inflation-down score favors long duration.
-            - Nelson–Siegel level checks Treasury momentum and exhaustion signals. Nelson–Siegel slope checks
-              curve signals, while curvature checks butterfly signals.
-            - A trade is rejected only when available evidence strongly contradicts it. Neutral or missing
-              context does not block a trade. All inputs are observed on the signal date and execution still
-              occurs after the configured lag.
-            """
-        )
-    else:
+    if not use_regime_filters:
         st.warning("Regime filtering is disabled; every candidate signal proceeds to execution when enough future data exist.")
 
     regime_inputs = pd.DataFrame(
