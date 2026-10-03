@@ -538,9 +538,9 @@ def _render_methodology(
           - **Momentum** (use **±1 SD** threshold and trigger when the threshold is first crossed)
             - **Directional yield:** 5-day changes in the 10Y yield
           - **Mean Reversion** (use **±2 SD** threshold for more abnormal market deviation, and trigger when reading crosses back in)
-            - **Directional yield:** 20-day yield reversal.
-            - **Curve:** 2s10s and 5s30s normalization.
-            - **Butterfly:** 5Y relative value against the 2Y and 10Y yields.
+            - **Directional yield:** 20-day yield reversal
+            - **Curve:** 2s10s and 5s30s normalization
+            - **Butterfly:** 5Y relative value against the 2Y and 10Y yields
         - The **{rolling_window}-day** lookback gives approximately one trading year of recent history.
         - The **{signal_lag}-day** entry lag prevents same-day execution on the signal. The common
         **{holding_period}-day** holding period provides a consistent short-term comparison across signals.
