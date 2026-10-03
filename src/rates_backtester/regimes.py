@@ -35,6 +35,9 @@ _LEVEL_CONFIRMATION = {
 }
 
 
+YIELD_DIRECTION_MIN_ABS_SCORE = 2.0
+
+
 def _finite_value(row: pd.Series, name: str) -> float | None:
     value = row.get(name)
     if value is None or pd.isna(value):
@@ -67,17 +70,17 @@ def evaluate_regime_filter(frame: pd.DataFrame, event: SignalEvent) -> RegimeDec
 
     duration_direction = _duration_direction(event.signal_name)
     if abs(duration_direction) > 1e-9:
-        context_score = _finite_value(row, "duration_regime_score")
-        if context_score is not None and context_score != 0:
+        context_score = _finite_value(row, "yield_direction_score")
+        if context_score is not None and abs(context_score) >= YIELD_DIRECTION_MIN_ABS_SCORE:
             # Positive context favors rising yields/short duration; negative
             # context favors falling yields/long duration.
             if duration_direction * context_score > 0:
                 return RegimeDecision(
                     event,
                     False,
-                    "duration regime",
+                    "yield-direction score",
                     context_score,
-                    "Risk and inflation context conflicts with the trade's duration direction.",
+                    "Market context conflicts with the trade direction.",
                 )
 
         if event.signal_name in _LEVEL_CONFIRMATION:
@@ -95,9 +98,9 @@ def evaluate_regime_filter(frame: pd.DataFrame, event: SignalEvent) -> RegimeDec
             return RegimeDecision(
                 event,
                 True,
-                "duration regime",
+                "yield-direction score",
                 context_score,
-                "Available context is neutral or does not conflict with the trade's duration direction.",
+                "Available market context is neutral or does not conflict with the trade.",
             )
 
     confirmation_field = _SHAPE_CONFIRMATION.get(event.signal_name)

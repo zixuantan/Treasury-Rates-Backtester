@@ -134,6 +134,18 @@ SIGNAL_RULES: tuple[SignalRule, ...] = (
 )
 
 
+MEAN_REVERSION_SIGNALS = {
+    "yield_selloff_exhaustion",
+    "yield_rally_exhaustion",
+    "curve_too_flat",
+    "curve_too_steep",
+    "long_end_too_flat",
+    "long_end_too_steep",
+    "five_y_cheap",
+    "five_y_rich",
+}
+
+
 SIGNAL_TO_TRADE: dict[str, SignalTradeMapping] = {
     "hot_CPI": build_multi_leg_mapping(
         trade_type="short_duration",
@@ -210,8 +222,8 @@ SIGNAL_TO_TRADE: dict[str, SignalTradeMapping] = {
         label="5s30s Steepener",
         short_tenor="5Y",
         long_tenor="30Y",
-        short_side="short",
-        long_side="long",
+        short_side="long",
+        long_side="short",
         rationale="5s30s is unusually flat. Bet on steepening, meaning 30Y - 5Y increases.",
     ),
     "long_end_too_steep": build_curve_mapping(
@@ -219,8 +231,8 @@ SIGNAL_TO_TRADE: dict[str, SignalTradeMapping] = {
         label="5s30s Flattener",
         short_tenor="5Y",
         long_tenor="30Y",
-        short_side="long",
-        long_side="short",
+        short_side="short",
+        long_side="long",
         rationale="5s30s is unusually steep. Bet on flattening, meaning 30Y - 5Y decreases.",
     ),
     "five_y_cheap": build_butterfly_mapping(
@@ -248,14 +260,28 @@ def _compare(value: float, operator: str, threshold: float) -> bool:
     raise ValueError(f"Unsupported operator: {operator}")
 
 
-def generate_signal_events(frame: pd.DataFrame) -> list[SignalEvent]:
+def generate_signal_events(
+    frame: pd.DataFrame,
+    *,
+    fresh_crossings_only: bool = True,
+) -> list[SignalEvent]:
     events: list[SignalEvent] = []
     for rule in SIGNAL_RULES:
         if rule.metric not in frame.columns:
             continue
-        for date, value in frame[rule.metric].dropna().items():
-            if not _compare(float(value), rule.operator, rule.threshold):
-                continue
+        series = frame[rule.metric]
+        beyond_threshold = series.map(
+            lambda value: False if pd.isna(value) else _compare(float(value), rule.operator, rule.threshold)
+        )
+        if rule.name in MEAN_REVERSION_SIGNALS:
+            # An extreme is only a setup. Enter after the feature starts to
+            # normalize by crossing back inside its threshold.
+            active = beyond_threshold.shift(1, fill_value=False) & ~beyond_threshold
+        elif fresh_crossings_only:
+            active = beyond_threshold & ~beyond_threshold.shift(1, fill_value=False)
+        else:
+            active = beyond_threshold
+        for date, value in series[active].items():
             events.append(
                 SignalEvent(
                     date=pd.Timestamp(date),

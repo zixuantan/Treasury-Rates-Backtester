@@ -11,15 +11,18 @@ A small, modular Python backtester for Treasury yield-curve and relative-value t
 - Fixed-decay Nelson-Siegel level, slope, curvature, and fit-error factors
 - Optional breakeven, broad-dollar, credit-spread, SPY, and VIX context
 - Declarative signal rules mapped to trade templates
-- Optional conflict-veto regime filters using risk sentiment, inflation context, and Nelson–Siegel factors
+- Optional Market Regime Filter using risk sentiment, inflation context, and Nelson–Siegel factors
 - Trading-day simulation with duration-based approximate dollar P&L
+- New-threshold-crossing entries with simple per-signal overlap and cooldown controls
 - Portfolio metrics and trade logs
 
 ## Data source
 
 - Raw Treasury inputs live in `Treasury Yield/` as `DGS2.csv`, `DGS5.csv`, `DGS10.csv`, and `DGS30.csv`
+- The bundled Treasury history runs from February 2006, when the 30-year constant-maturity series resumed, through the latest common observation.
 - `load_dataset("Treasury Yield")` merges those files into a single wide frame with `date`, `y2`, `y5`, `y10`, and `y30`
 - Raw risk-sentiment inputs live in `Risk Sentiment Metrics/` as `SP500.csv` and `VIXCLS.csv`
+- VIX history begins in February 2006. FRED distributes only ten years of daily S&P 500 history, so that input begins in October 2016.
 - `load_dataset("Risk Sentiment Metrics")` merges those files into a single wide frame with `date`, `SPY`, and `VIX`
 - `load_dataset(".")` merges both folders when they are present in the workspace root
 - Optional FRED-format context files can live in `Market Context/` as `T5YIE.csv`, `T10YIE.csv`, `T5YIFR.csv`, `DTWEXBGS.csv`, `BAMLH0A0HYM2.csv`, and `BAMLC0A0CM.csv`
@@ -30,7 +33,7 @@ A small, modular Python backtester for Treasury yield-curve and relative-value t
 - Canonical input is a wide dataframe with one row per trading date.
 - Signals are evaluated without lookahead by shifting feature inputs.
 - Multiple positions can be open at once.
-- Regime filters are enabled by default. Missing or neutral context does not block a trade; clearly contradictory context does.
+- The Market Regime Filter is enabled by default. Missing or neutral context does not block a trade; clearly contradictory context does.
 - P&L uses a yield-change approximation, not full bond pricing.
 - Treasury yields expressed in percentage points are converted to decimal changes before P&L is calculated.
 - `gross_notional` is the total absolute dollar notional allocated across a trade's legs.
@@ -43,33 +46,33 @@ The backtest follows this sequence:
 ```text
 Input data
   -> calculate features and rolling z-scores
-  -> generate signals whenever threshold conditions are met
+  -> generate momentum signals on outward crossings and yield-reversal, curve, and butterfly signals on re-entry crossings
   -> map each signal to a duration, curve, or butterfly trade
   -> enter on the next trading row
   -> hold for five trading days by default
-  -> exit and calculate approximate P&L
-  -> aggregate portfolio metrics
+  -> mark open trades to market each day using approximate duration P&L
+  -> calculate daily portfolio returns and aggregate portfolio metrics
 ```
 
 The main active signal families are:
 
-- **Duration:** long or short 10Y momentum and reversal trades
+- **Directional yield:** long or short 10Y momentum and reversal trades
 - **Curve:** 2s10s and 5s30s steepeners or flatteners
 - **Butterfly:** long or short 2s5s10s relative-value trades
 
 CPI and payroll signal definitions are present, but they remain inactive without timestamped first-release actual and pre-release consensus data.
 
-Signals are evaluated independently on every date. If a condition remains beyond its threshold for several consecutive days, the engine opens a new trade each day. It does not currently require a fresh threshold crossing, impose a cooldown, or prevent an equivalent trade from already being open.
+Momentum and macro signals use new outward threshold crossings by default. A signal that is already beyond its threshold cannot trigger again until it first moves back inside and then crosses outward again. Yield-reversal, curve, and butterfly signals treat an extreme as a setup and enter only when the feature crosses back inside its threshold. The execution layer permits one active trade per signal and applies a five-trading-day post-exit cooldown.
 
 For example:
 
 ```text
-Monday:    signal is true -> enter trade A on Tuesday
-Tuesday:   signal is true -> enter trade B on Wednesday
-Wednesday: signal is true -> enter trade C on Thursday
+Monday:    momentum threshold is crossed outward -> enter trade A on Tuesday
+Tuesday:   momentum signal remains beyond it     -> no new candidate
+Wednesday: momentum signal remains beyond it     -> no new candidate
 ```
 
-All three trades can remain open simultaneously until their individual five-day holding periods end.
+Another momentum candidate can fire only after the threshold condition resets and crosses outward again. Yield-reversal, curve, and butterfly candidates instead require a crossing back inside after an extreme. Equivalent active trades and candidates inside the configured cooldown are skipped.
 
 ## Position sizing
 
@@ -126,7 +129,7 @@ P&L = -$1,000,000 x 1.0 x 8 x -0.001
 
 The long bond profits because its yield fell. A short position with the same move would lose approximately $8,000.
 
-Gross notional applies to every newly opened trade rather than to the portfolio as a whole. Three overlapping signals can therefore create three separate $1,000,000 gross positions. The current engine does not impose a portfolio-wide gross-exposure limit or net overlapping positions.
+Gross notional applies to every newly opened trade rather than to the portfolio as a whole. Different signal types can still overlap; the engine does not impose a portfolio-wide gross-exposure limit or net positions across signals.
 
 ## Package layout
 
@@ -167,9 +170,9 @@ python -m rates_backtester . --json
 The default terminal report includes:
 
 - Full input-data date range and effective completed-trade date range
-- Cumulative P&L, Sharpe ratio, maximum drawdown, win rate, and trade count
+- Cumulative P&L, cumulative return, annualized Sharpe, maximum drawdown, win rate, and trade count
 - Average winning and losing trade plus profit factor
-- P&L, average P&L, win rate, and trade count by strategy category
+- P&L, average P&L, win rate, and trade count by signal family
 - The same breakdown by individual signal and exit year
 
 The JSON output contains the same information under `period`, `portfolio`, and `pnl_breakdown`, followed by the complete signal and trade records.
@@ -183,9 +186,9 @@ pip install -e '.[dashboard]'
 streamlit run streamlit_app.py
 ```
 
-The Treasury Rates Backtester dashboard imports the same package pipeline used by the CLI. It includes headline metrics and test dates, filtered-versus-unfiltered performance and equity-curve comparisons, strategy-level filter impact, accepted/rejected signal diagnostics, an auditable trade log, Treasury curve history, regime scores, and Nelson–Siegel factors. Its Methodology tab defines every performance metric, documents every signal threshold and trade mapping, and explains position sizing and approximate P&L. Controls in the sidebar allow the lookback, holding period, entry lag, annualization factor, gross notional, and displayed filter mode to be changed without duplicating strategy code.
+The Treasury Rates Backtester dashboard imports the same package pipeline used by the CLI. It includes headline metrics and test dates, filtered-versus-unfiltered comparisons, strategy-level filter impact, accepted/rejected signal diagnostics, a trade log, Treasury curve history, regime scores, and Nelson–Siegel factors. Sidebar controls expose the lookback, holding period, entry lag, gross notional, starting portfolio capital, new-threshold-crossing mode, overlap policy, cooldown, and displayed filter mode. Sharpe annualization is fixed at 252 trading days.
 
-Regime filters are enabled by default and can be switched off in the sidebar or with `--no-regime-filters` on the CLI. Directional-duration candidates are vetoed when the combined SPY, VIX, available credit-spread, broad-dollar, and breakeven regime conflicts with the trade direction. Nelson–Siegel level, slope, and curvature can veto conflicting momentum/exhaustion, curve, and butterfly candidates respectively. The Signals tab reports every candidate and its accept/reject reason.
+The Market Regime Filter is enabled by default and can be switched off in the sidebar or with `--no-regime-filters` on the CLI. Directional Treasury candidates are vetoed only when the combined SPY, VIX, available credit-spread, broad-dollar, and breakeven Yield-Direction Score has a net opposing value with magnitude of at least two; a lone vote cannot veto a trade. Nelson–Siegel level, slope, and curvature can veto conflicting directional-yield, curve, and butterfly candidates respectively. The Signals tab reports every candidate and its accept/reject reason.
 
 ## Example
 
@@ -239,11 +242,11 @@ The project can run with Treasury yields plus SPY/VIX. The remaining datasets ar
 - Optional market-context fields currently enrich the research frame; they are not mapped to standalone trades.
 - Ordinary FRED macro histories can contain revisions and must not be treated as point-in-time observations.
 - P&L is a first-order duration approximation and excludes convexity, carry, rolldown, coupons, financing, transaction costs, and slippage.
-- Portfolio P&L is recognized on trade exit dates rather than marked to market each day.
+- Open trades are marked to market each trading day using the same first-order duration approximation. Daily returns use the previous day's portfolio value and assume a zero risk-free rate.
 
 ## Next steps
 
 1. Freeze the desired FRED market-context series into `Market Context/` for reproducible runs.
 2. Define and validate trading rules that use breakeven, dollar, credit, or Nelson-Siegel factors.
 3. Add point-in-time CPI and payroll release/consensus data before enabling macro-surprise strategies.
-4. Add daily mark-to-market accounting and execution costs before interpreting production-level performance.
+4. Add execution costs before interpreting production-level performance.

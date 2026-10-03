@@ -16,7 +16,13 @@ from .data import (
 )
 from .features import DEFAULT_ROLLING_WINDOW, add_market_context_metrics, add_required_metrics, rolling_zscore
 from .nelson_siegel import add_nelson_siegel_factors
-from .portfolio import PortfolioMetrics, PnlBreakdownRow, summarize_pnl_breakdown, summarize_portfolio
+from .portfolio import (
+    PortfolioMetrics,
+    PnlBreakdownRow,
+    build_daily_portfolio,
+    summarize_pnl_breakdown,
+    summarize_portfolio,
+)
 from .regimes import RegimeDecision, apply_regime_filters
 from .signals import SIGNAL_TO_TRADE, SignalEvent, generate_signal_events
 from .trades import DURATION_ESTIMATES, SignalTradeMapping, normalize_gross_weights
@@ -29,6 +35,7 @@ class BacktestRun:
     frame: pd.DataFrame
     signal_events: list[SignalEvent]
     trades: list[TradeResult]
+    daily_portfolio: pd.DataFrame
     portfolio: PortfolioMetrics
     regime_decisions: tuple[RegimeDecision, ...] = ()
 
@@ -140,9 +147,17 @@ def simulate_signal_events(
     events: Iterable[SignalEvent],
     config: BacktestConfig = BacktestConfig(),
 ) -> list[TradeResult]:
+    if config.gross_notional <= 0:
+        raise ValueError("gross_notional must be positive")
+    if config.holding_period < 1:
+        raise ValueError("holding_period must be at least 1")
+    if config.signal_lag < 0 or config.cooldown_period < 0:
+        raise ValueError("signal_lag and cooldown_period cannot be negative")
+
     results: list[TradeResult] = []
+    scheduled: list[tuple[str, int, int]] = []
     index = frame.index
-    for event in events:
+    for event in sorted(events, key=lambda item: (item.date, item.signal_name)):
         mapping = SIGNAL_TO_TRADE.get(event.signal_name)
         if mapping is None:
             continue
@@ -156,8 +171,17 @@ def simulate_signal_events(
         exit_index = entry_index + config.holding_period
         if entry_index >= len(index) or exit_index >= len(index):
             continue
-        if config.gross_notional <= 0:
-            raise ValueError("gross_notional must be positive")
+        same_signal = [item for item in scheduled if item[0] == event.signal_name]
+        if config.one_active_trade_per_signal and any(
+            prior_entry <= entry_index <= prior_exit
+            for _, prior_entry, prior_exit in same_signal
+        ):
+            continue
+        if config.cooldown_period and any(
+            prior_exit < entry_index <= prior_exit + config.cooldown_period
+            for _, _, prior_exit in same_signal
+        ):
+            continue
         legs = _legs_for_mapping(mapping)
         pnl = _pnl_for_legs(
             frame,
@@ -184,6 +208,7 @@ def simulate_signal_events(
                 },
             )
         )
+        scheduled.append((event.signal_name, entry_index, exit_index))
     return results
 
 
@@ -194,18 +219,33 @@ def run_backtest(
     config: BacktestConfig = BacktestConfig(),
 ) -> BacktestRun:
     prepared = prepare_dataset(frame, rolling_window=rolling_window)
-    signal_events = generate_signal_events(prepared)
+    signal_events = generate_signal_events(
+        prepared,
+        fresh_crossings_only=config.fresh_crossings_only,
+    )
     accepted_events, regime_decisions = apply_regime_filters(
         prepared,
         signal_events,
         enabled=config.use_regime_filters,
     )
     trades = simulate_signal_events(prepared, accepted_events, config=config)
-    portfolio = summarize_portfolio(trades, annualization_factor=config.annualization_factor)
+    evaluation_start = prepared.index[min(rolling_window, len(prepared) - 1)] if not prepared.empty else None
+    daily_portfolio = build_daily_portfolio(
+        prepared,
+        trades,
+        starting_capital=config.starting_capital,
+        evaluation_start=evaluation_start,
+    )
+    portfolio = summarize_portfolio(
+        trades,
+        daily_portfolio,
+        annualization_factor=config.annualization_factor,
+    )
     return BacktestRun(
         frame=prepared,
         signal_events=signal_events,
         trades=trades,
+        daily_portfolio=daily_portfolio,
         portfolio=portfolio,
         regime_decisions=regime_decisions,
     )
@@ -252,7 +292,21 @@ def backtest_run_to_dict(result: BacktestRun) -> dict[str, object]:
             "last_trade_exit": last_exit.isoformat() if last_exit is not None else None,
         },
         "portfolio": {
+            "starting_capital": (
+                float(
+                    result.daily_portfolio["portfolio_value"].iloc[0]
+                    - result.daily_portfolio["daily_pnl"].iloc[0]
+                )
+                if not result.daily_portfolio.empty
+                else None
+            ),
+            "ending_portfolio_value": (
+                float(result.daily_portfolio["portfolio_value"].iloc[-1])
+                if not result.daily_portfolio.empty
+                else None
+            ),
             "cumulative_pnl": result.portfolio.cumulative_pnl,
+            "cumulative_return": result.portfolio.cumulative_return,
             "sharpe_ratio": result.portfolio.sharpe_ratio,
             "max_drawdown": result.portfolio.max_drawdown,
             "win_rate": result.portfolio.win_rate,

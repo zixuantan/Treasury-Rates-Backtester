@@ -167,6 +167,6 @@ def add_market_context_metrics(frame: pd.DataFrame, window: int = DEFAULT_ROLLIN
     ]
     if score_columns:
         score_frame = pd.concat(score_columns, axis=1)
-        enriched["duration_regime_score"] = score_frame.sum(axis=1, min_count=1).astype("Int64")
+        enriched["yield_direction_score"] = score_frame.sum(axis=1, min_count=1).astype("Int64")
 
     return enriched

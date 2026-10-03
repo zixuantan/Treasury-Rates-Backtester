@@ -13,9 +13,16 @@ from .market_data import (
     export_fred_csv_directory,
 )
 from .nelson_siegel import NelsonSiegelFit, add_nelson_siegel_factors, fit_nelson_siegel_curve, nelson_siegel_curve
-from .portfolio import PnlBreakdown, PnlBreakdownRow, PortfolioMetrics, summarize_pnl_breakdown, summarize_portfolio
+from .portfolio import (
+    PnlBreakdown,
+    PnlBreakdownRow,
+    PortfolioMetrics,
+    build_daily_portfolio,
+    summarize_pnl_breakdown,
+    summarize_portfolio,
+)
 from .regimes import RegimeDecision, apply_regime_filters, evaluate_regime_filter
-from .signals import SIGNAL_RULES, SIGNAL_TO_TRADE, SignalEvent, generate_signal_events
+from .signals import MEAN_REVERSION_SIGNALS, SIGNAL_RULES, SIGNAL_TO_TRADE, SignalEvent, generate_signal_events
 from .pipeline import BacktestRun, backtest_run_to_dict, load_dataset, prepare_dataset, run_backtest, run_backtest_from_path, simulate_signal_events
 from .simulation import TradeResult
 from .trades import SignalTradeMapping, TradeLegSpec
@@ -27,6 +34,7 @@ __all__ = [
     "FREDResult",
     "export_fred_csv_directory",
     "MARKET_CONTEXT_SERIES",
+    "MEAN_REVERSION_SIGNALS",
     "NelsonSiegelFit",
     "PortfolioMetrics",
     "RegimeDecision",
@@ -47,6 +55,7 @@ __all__ = [
     "add_market_context_metrics",
     "add_nelson_siegel_factors",
     "butterfly_2s5s10s",
+    "build_daily_portfolio",
     "canonicalize_yield_frame",
     "curve_spread",
     "load_dataset",

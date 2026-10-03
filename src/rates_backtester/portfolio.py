@@ -12,6 +12,7 @@ from .simulation import TradeResult
 @dataclass(frozen=True)
 class PortfolioMetrics:
     cumulative_pnl: float
+    cumulative_return: float
     sharpe_ratio: float
     max_drawdown: float
     win_rate: float
@@ -39,16 +40,14 @@ class PnlBreakdown:
 
 def _strategy_category(trade: TradeResult) -> str:
     signal = trade.signal_name
-    if "momentum" in signal:
-        return "momentum"
-    if "exhaustion" in signal:
-        return "exhaustion"
+    if "momentum" in signal or "exhaustion" in signal:
+        return "directional yield"
     if signal.startswith(("curve_", "long_end_")):
         return "curve"
     if signal.startswith("five_y_"):
         return "butterfly"
     if signal in {"hot_CPI", "cold_CPI", "strong_payrolls", "weak_payrolls"}:
-        return "macro"
+        return "macro surprise"
     return trade.template.value
 
 
@@ -98,14 +97,49 @@ def summarize_pnl_breakdown(trades: Sequence[TradeResult]) -> PnlBreakdown:
     )
 
 
-def _daily_pnl_series(trades: Sequence[TradeResult]) -> pd.Series:
-    if not trades:
-        return pd.Series(dtype=float)
-    records = [(trade.exit_date, trade.pnl) for trade in trades]
-    index = pd.DatetimeIndex([exit_date for exit_date, _ in records])
-    values = [pnl for _, pnl in records]
-    series = pd.Series(values, index=index).sort_index()
-    return series.groupby(level=0).sum().sort_index()
+def build_daily_portfolio(
+    frame: pd.DataFrame,
+    trades: Sequence[TradeResult],
+    *,
+    starting_capital: float,
+    evaluation_start: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Mark open trades to market each day using the duration approximation."""
+    if starting_capital <= 0:
+        raise ValueError("starting_capital must be positive")
+    if frame.empty:
+        return pd.DataFrame(
+            columns=["daily_pnl", "portfolio_value", "daily_return", "cumulative_return"]
+        )
+
+    start = pd.Timestamp(evaluation_start) if evaluation_start is not None else pd.Timestamp(frame.index.min())
+    dates = frame.index[frame.index >= start]
+    daily_pnl = pd.Series(0.0, index=dates, dtype=float)
+    yield_changes = frame[[column for column in ("2Y", "5Y", "10Y", "30Y") if column in frame]].diff() / 100.0
+
+    for trade in trades:
+        active_dates = dates[(dates > trade.entry_date) & (dates <= trade.exit_date)]
+        for leg in trade.legs:
+            daily_pnl.loc[active_dates] += (
+                -trade.gross_notional
+                * leg.weight
+                * leg.duration
+                * yield_changes.loc[active_dates, leg.tenor]
+            )
+
+    portfolio_value = starting_capital + daily_pnl.cumsum()
+    previous_value = portfolio_value.shift(1, fill_value=starting_capital)
+    if (previous_value <= 0).any() or (portfolio_value <= 0).any():
+        raise ValueError("starting_capital is too small for the simulated portfolio losses")
+    daily_return = daily_pnl / previous_value
+    return pd.DataFrame(
+        {
+            "daily_pnl": daily_pnl,
+            "portfolio_value": portfolio_value,
+            "daily_return": daily_return,
+            "cumulative_return": portfolio_value / starting_capital - 1.0,
+        }
+    )
 
 
 def _max_drawdown(equity_curve: pd.Series) -> float:
@@ -117,16 +151,22 @@ def _max_drawdown(equity_curve: pd.Series) -> float:
     return float(drawdown.min())
 
 
-def summarize_portfolio(trades: Sequence[TradeResult], annualization_factor: int = 252) -> PortfolioMetrics:
-    if not trades:
-        return PortfolioMetrics(0.0, 0.0, 0.0, 0.0, 0)
-    daily_pnl = _daily_pnl_series(trades)
+def summarize_portfolio(
+    trades: Sequence[TradeResult],
+    daily_portfolio: pd.DataFrame,
+    annualization_factor: int = 252,
+) -> PortfolioMetrics:
+    if daily_portfolio.empty:
+        return PortfolioMetrics(0.0, 0.0, 0.0, 0.0, 0.0, len(trades))
+    daily_pnl = daily_portfolio["daily_pnl"]
+    daily_returns = daily_portfolio["daily_return"]
     cumulative = float(daily_pnl.sum())
-    equity_curve = daily_pnl.cumsum()
-    if len(daily_pnl) > 1 and daily_pnl.std(ddof=0) != 0:
-        sharpe = float(daily_pnl.mean() / daily_pnl.std(ddof=0) * sqrt(annualization_factor))
+    cumulative_return = float(daily_portfolio["cumulative_return"].iloc[-1])
+    if len(daily_returns) > 1 and daily_returns.std(ddof=1) != 0:
+        sharpe = float(daily_returns.mean() / daily_returns.std(ddof=1) * sqrt(annualization_factor))
     else:
         sharpe = 0.0
-    win_rate = float(sum(1 for trade in trades if trade.pnl > 0) / len(trades))
-    max_dd = _max_drawdown(equity_curve) if not equity_curve.empty else 0.0
-    return PortfolioMetrics(cumulative, sharpe, max_dd, win_rate, len(trades))
+    win_rate = float(sum(1 for trade in trades if trade.pnl > 0) / len(trades)) if trades else 0.0
+    portfolio_value = daily_portfolio["portfolio_value"]
+    max_dd = _max_drawdown(portfolio_value - float(portfolio_value.iloc[0]))
+    return PortfolioMetrics(cumulative, cumulative_return, sharpe, max_dd, win_rate, len(trades))

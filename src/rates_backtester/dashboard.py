@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from .pipeline import BacktestRun, backtest_run_to_dict, run_backtest_from_path
-from .signals import SIGNAL_RULES, SIGNAL_TO_TRADE
+from .signals import MEAN_REVERSION_SIGNALS, SIGNAL_RULES, SIGNAL_TO_TRADE
 from .trades import normalize_gross_weights
 from .types import BacktestConfig
 
@@ -21,8 +21,8 @@ SIGNAL_DISPLAY_NAMES = {
     "weak_payrolls": "Weak Payrolls Surprise",
     "yield_selloff_momentum": "10Y Yield Selloff Momentum",
     "yield_rally_momentum": "10Y Yield Rally Momentum",
-    "yield_selloff_exhaustion": "10Y Yield Selloff Exhaustion",
-    "yield_rally_exhaustion": "10Y Yield Rally Exhaustion",
+    "yield_selloff_exhaustion": "10Y Yield Selloff Reversal",
+    "yield_rally_exhaustion": "10Y Yield Rally Reversal",
     "curve_too_flat": "2s10s Curve Too Flat",
     "curve_too_steep": "2s10s Curve Too Steep",
     "long_end_too_flat": "5s30s Curve Too Flat",
@@ -44,7 +44,11 @@ def _run_cached(
     signal_lag: int,
     annualization_factor: int,
     gross_notional: float,
+    starting_capital: float,
     use_regime_filters: bool,
+    fresh_crossings_only: bool,
+    one_active_trade_per_signal: bool,
+    cooldown_period: int,
 ) -> BacktestRun:
     return run_backtest_from_path(
         Path(path),
@@ -54,7 +58,11 @@ def _run_cached(
             signal_lag=signal_lag,
             annualization_factor=annualization_factor,
             gross_notional=gross_notional,
+            starting_capital=starting_capital,
             use_regime_filters=use_regime_filters,
+            fresh_crossings_only=fresh_crossings_only,
+            one_active_trade_per_signal=one_active_trade_per_signal,
+            cooldown_period=cooldown_period,
         ),
     )
 
@@ -110,7 +118,7 @@ def _trade_frame(result: BacktestRun) -> pd.DataFrame:
                 "Exit": trade.exit_date,
                 "P&L": trade.pnl,
                 "Result": "Win" if trade.pnl > 0 else "Loss" if trade.pnl < 0 else "Flat",
-                "Regime filter": decision.filter_name if decision else "not recorded",
+                "Market Regime Filter": decision.filter_name if decision else "not recorded",
                 "Regime score": decision.score if decision else None,
                 "Acceptance reason": decision.reason if decision else "No filter decision recorded.",
                 "Legs": legs,
@@ -120,20 +128,18 @@ def _trade_frame(result: BacktestRun) -> pd.DataFrame:
 
 
 def _equity_curve(result: BacktestRun) -> pd.DataFrame:
-    if not result.trades:
-        return pd.DataFrame(columns=["Cumulative P&L"])
-    realized = pd.DataFrame(
-        {"date": [trade.exit_date for trade in result.trades], "pnl": [trade.pnl for trade in result.trades]}
+    if result.daily_portfolio.empty:
+        return pd.DataFrame(columns=["Cumulative return"])
+    return result.daily_portfolio[["cumulative_return"]].rename(
+        columns={"cumulative_return": "Cumulative return"}
     )
-    daily = realized.groupby("date", as_index=True)["pnl"].sum().sort_index()
-    return daily.cumsum().rename("Cumulative P&L").to_frame()
 
 
 def _equity_comparison(filtered_result: BacktestRun, unfiltered_result: BacktestRun) -> pd.DataFrame:
     comparison = pd.concat(
         [
-            _equity_curve(unfiltered_result).rename(columns={"Cumulative P&L": "Without filters"}),
-            _equity_curve(filtered_result).rename(columns={"Cumulative P&L": "With filters"}),
+            _equity_curve(unfiltered_result).rename(columns={"Cumulative return": "Without filters"}),
+            _equity_curve(filtered_result).rename(columns={"Cumulative return": "With filters"}),
         ],
         axis=1,
     ).sort_index()
@@ -155,7 +161,8 @@ def _performance_comparison(
     return pd.DataFrame(
         [
             ("Cumulative P&L", _money(unfiltered["cumulative_pnl"]), _money(filtered["cumulative_pnl"]), _money(filtered["cumulative_pnl"] - unfiltered["cumulative_pnl"])),
-            ("Sharpe ratio", f"{unfiltered['sharpe_ratio']:.2f}", f"{filtered['sharpe_ratio']:.2f}", f"{filtered['sharpe_ratio'] - unfiltered['sharpe_ratio']:+.2f}"),
+            ("Cumulative return", f"{unfiltered['cumulative_return']:.2%}", f"{filtered['cumulative_return']:.2%}", f"{filtered['cumulative_return'] - unfiltered['cumulative_return']:+.2%}"),
+            ("Annualized Sharpe", f"{unfiltered['sharpe_ratio']:.2f}", f"{filtered['sharpe_ratio']:.2f}", f"{filtered['sharpe_ratio'] - unfiltered['sharpe_ratio']:+.2f}"),
             ("Maximum drawdown", _money(unfiltered["max_drawdown"]), _money(filtered["max_drawdown"]), _money(filtered["max_drawdown"] - unfiltered["max_drawdown"])),
             ("Win rate", f"{unfiltered['win_rate']:.1%}", f"{filtered['win_rate']:.1%}", f"{filtered['win_rate'] - unfiltered['win_rate']:+.1%}"),
             ("Profit factor", ratio(unfiltered_breakdown["profit_factor"]), ratio(filtered_breakdown["profit_factor"]), "—"),
@@ -208,45 +215,50 @@ def _render_header(payload: dict[str, object], use_regime_filters: bool) -> None
 
     st.markdown('<p class="eyebrow">SYSTEMATIC RATES RESEARCH</p>', unsafe_allow_html=True)
     st.title("Treasury Rates Backtester")
-    st.caption("Duration, curve and butterfly signals translated into reproducible five-day trade simulations.")
 
     st.markdown(
         f"""
         <div class="period-strip">
             <span><b>Input data</b> {_date(period['data_start'])} → {_date(period['data_end'])}</span>
             <span><b>Completed trades</b> {_date(period['first_trade_entry'])} → {_date(period['last_trade_exit'])}</span>
-            <span><b>Displayed mode</b> Regime filters {'on' if use_regime_filters else 'off'}</span>
+            <span><b>Displayed mode</b> Market Regime Filter {'on' if use_regime_filters else 'off'}</span>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    columns = st.columns(5)
-    columns[0].metric(
-        "Cumulative P&L",
-        _money(portfolio["cumulative_pnl"]),
-        help="Sum of approximate P&L from all completed trades. P&L is recognized on exit dates.",
-    )
-    columns[1].metric(
-        "Sharpe ratio",
-        f"{portfolio['sharpe_ratio']:.2f}",
-        help="Mean daily realized P&L divided by its population standard deviation, annualized by the selected factor.",
-    )
-    columns[2].metric(
-        "Max drawdown",
-        _money(portfolio["max_drawdown"]),
-        help="Largest peak-to-trough decline in cumulative realized P&L, including a zero starting baseline.",
-    )
-    columns[3].metric(
-        "Win rate",
-        f"{portfolio['win_rate']:.1%}",
-        help="Percentage of completed trades whose approximate P&L is greater than zero.",
-    )
-    columns[4].metric(
-        "Profit factor",
-        f"{breakdown['profit_factor']:.2f}" if breakdown["profit_factor"] else "n/a",
-        help="Gross profit from winning trades divided by the absolute gross loss from losing trades.",
-    )
+    with st.container(key="headline_metrics"):
+        columns = st.columns(6)
+        columns[0].metric(
+            "Cumulative P&L",
+            _money(portfolio["cumulative_pnl"]),
+            help="Sum of daily mark-to-market P&L across all simulated trades.",
+        )
+        columns[1].metric(
+            "Cumulative return",
+            f"{portfolio['cumulative_return']:.2%}",
+            help="Ending portfolio value divided by starting portfolio capital, minus one.",
+        )
+        columns[2].metric(
+            "Annualized Sharpe",
+            f"{portfolio['sharpe_ratio']:.2f}",
+            help="Mean daily portfolio return divided by daily return volatility, multiplied by the square root of 252.",
+        )
+        columns[3].metric(
+            "Max drawdown",
+            _money(portfolio["max_drawdown"]),
+            help="Largest peak-to-trough decline in the daily marked-to-market portfolio value.",
+        )
+        columns[4].metric(
+            "Win rate",
+            f"{portfolio['win_rate']:.1%}",
+            help="Percentage of completed trades whose approximate P&L is greater than zero.",
+        )
+        columns[5].metric(
+            "Profit factor",
+            f"{breakdown['profit_factor']:.2f}" if breakdown["profit_factor"] else "n/a",
+            help="Gross profit from winning trades divided by the absolute gross loss from losing trades.",
+        )
 
 
 def _render_overview(
@@ -258,7 +270,7 @@ def _render_overview(
     unfiltered_payload: dict[str, object],
 ) -> None:
     breakdown = payload["pnl_breakdown"]
-    st.subheader("Regime-filter impact")
+    st.subheader("Market Regime Filter impact")
     candidates = len(filtered_result.regime_decisions)
     accepted = sum(decision.passed for decision in filtered_result.regime_decisions)
     rejected = candidates - accepted
@@ -279,8 +291,8 @@ def _render_overview(
 
     left, right = st.columns((1.65, 1.0), gap="large")
     with left:
-        st.subheader("Realized equity curves")
-        st.caption("P&L is recognized on each trade's exit date; this is not daily mark-to-market accounting.")
+        st.subheader("Cumulative return")
+        st.caption("Open trades are marked to market on every trading day using the duration approximation.")
         st.line_chart(_equity_comparison(filtered_result, unfiltered_result), height=345)
     with right:
         st.subheader("P&L by strategy family")
@@ -306,7 +318,7 @@ def _render_breakdowns(
     unfiltered_payload: dict[str, object],
 ) -> None:
     breakdown = payload["pnl_breakdown"]
-    st.subheader("Regime-filter impact by strategy family")
+    st.subheader("Market Regime Filter impact by strategy family")
     st.dataframe(
         _breakdown_comparison(filtered_payload, unfiltered_payload, "by_category", "Category"),
         hide_index=True,
@@ -317,7 +329,7 @@ def _render_breakdowns(
             "P&L change": st.column_config.NumberColumn(format="$%.2f"),
         },
     )
-    st.subheader("Regime-filter impact by signal")
+    st.subheader("Market Regime Filter impact by signal")
     st.dataframe(
         _breakdown_comparison(filtered_payload, unfiltered_payload, "by_signal", "Signal"),
         hide_index=True,
@@ -350,7 +362,7 @@ def _render_signals(result: BacktestRun) -> None:
                 "Value": event.metric_value,
                 "Threshold": event.threshold,
                 "Interpretation": event.interpretation,
-                "Regime filter": (
+                "Market Regime Filter": (
                     "Accepted"
                     if decisions.get((event.date, event.signal_name), None) is None
                     or decisions[(event.date, event.signal_name)].passed
@@ -379,15 +391,18 @@ def _render_signals(result: BacktestRun) -> None:
         st.info("No signals fired for the selected configuration.")
         return
     counts = (
-        events.groupby(["Signal", "Regime filter"])
+        events.groupby(["Signal", "Market Regime Filter"])
         .size()
         .unstack(fill_value=0)
         .reindex(columns=["Accepted", "Rejected"], fill_value=0)
         .sort_index()
     )
-    accepted = int((events["Regime filter"] == "Accepted").sum())
-    rejected = int((events["Regime filter"] == "Rejected").sum())
-    st.caption(f"{len(events):,} candidate signals · {accepted:,} accepted · {rejected:,} rejected by regime filters")
+    accepted = int((events["Market Regime Filter"] == "Accepted").sum())
+    rejected = int((events["Market Regime Filter"] == "Rejected").sum())
+    st.caption(
+        f"{len(events):,} candidate signals · {accepted:,} accepted · "
+        f"{rejected:,} rejected by the Market Regime Filter"
+    )
     left, right = st.columns((1.0, 1.6), gap="large")
     with left:
         st.subheader("Candidate-signal outcomes")
@@ -401,19 +416,26 @@ def _render_signals(result: BacktestRun) -> None:
             default=["Accepted", "Rejected"],
         )
         visible = events[events["Signal"].isin(selected)] if selected else events
-        visible = visible[visible["Regime filter"].isin(statuses)]
+        visible = visible[visible["Market Regime Filter"].isin(statuses)]
         st.dataframe(visible.sort_values("Date", ascending=False), hide_index=True, width="stretch", height=420)
 
 
 def _signal_dictionary(result: BacktestRun) -> pd.DataFrame:
-    feature_descriptions = {
-        "z_cpi_surprise": "CPI actual minus consensus, standardized against prior observations",
-        "z_nfp_surprise": "Payroll actual minus consensus, standardized against prior observations",
-        "z_y10_change_5d": "5-day change in the 10Y yield, standardized against prior history",
-        "z_y10_change_20d": "20-day change in the 10Y yield, standardized against prior history",
-        "z_2s10s": "10Y minus 2Y yield spread, standardized against prior history",
-        "z_5s30s": "30Y minus 5Y yield spread, standardized against prior history",
-        "z_butterfly": "5Y minus the average of 2Y and 10Y yields, standardized against prior history",
+    trigger_descriptions = {
+        "hot_CPI": "CPI was significantly higher than the market expected",
+        "cold_CPI": "CPI was significantly lower than the market expected",
+        "strong_payrolls": "Employment growth was significantly stronger than the market expected",
+        "weak_payrolls": "Employment growth was significantly weaker than the market expected",
+        "yield_selloff_momentum": "The 10Y yield has risen unusually quickly over five days",
+        "yield_rally_momentum": "The 10Y yield has fallen unusually quickly over five days",
+        "yield_selloff_exhaustion": "The 10Y yield has risen unusually far over 20 days and may be overextended",
+        "yield_rally_exhaustion": "The 10Y yield has fallen unusually far over 20 days and may be overextended",
+        "curve_too_flat": "The 2s10s spread is unusually low, meaning the curve is very flat or inverted",
+        "curve_too_steep": "The 2s10s spread is unusually high, meaning the curve is very steep",
+        "long_end_too_flat": "The 5s30s spread is unusually low, meaning the long end is very flat",
+        "long_end_too_steep": "The 5s30s spread is unusually high, meaning the long end is very steep",
+        "five_y_cheap": "The 5Y yield is unusually high relative to the 2Y and 10Y yields, so the 5Y bond appears cheap",
+        "five_y_rich": "The 5Y yield is unusually low relative to the 2Y and 10Y yields, so the 5Y bond appears rich",
     }
     event_counts: dict[str, int] = {}
     accepted_counts: dict[str, int] = {}
@@ -426,6 +448,12 @@ def _signal_dictionary(result: BacktestRun) -> pd.DataFrame:
     rows = []
     for rule in SIGNAL_RULES:
         mapping = SIGNAL_TO_TRADE[rule.name]
+        if rule.name in MEAN_REVERSION_SIGNALS:
+            direction = "below" if rule.operator == ">" else "above"
+            trigger = f"{rule.metric} crosses back {direction} {rule.threshold:+g}"
+        else:
+            direction = "above" if rule.operator == ">" else "below"
+            trigger = f"{rule.metric} crosses {direction} {rule.threshold:+g}"
         weights = normalize_gross_weights(leg.weight for leg in mapping.legs)
         legs = ", ".join(
             f"{leg.side.title()} {leg.tenor} {weight:.1%}"
@@ -434,9 +462,9 @@ def _signal_dictionary(result: BacktestRun) -> pd.DataFrame:
         rows.append(
             {
                 "Signal": _signal_display_name(rule.name),
-                "Input status": "Available" if rule.metric in result.frame.columns else "Missing",
-                "Trigger": f"{rule.metric} {rule.operator} {rule.threshold:+g}",
-                "Feature meaning": feature_descriptions[rule.metric],
+                "Data availability": "Available" if rule.metric in result.frame.columns else "Missing",
+                "Trigger": trigger,
+                "What the trigger means": trigger_descriptions[rule.name],
                 "Trade": mapping.label,
                 "Gross allocation": legs,
                 "Events": event_counts.get(rule.name, 0),
@@ -454,64 +482,135 @@ def _render_methodology(
     holding_period: int,
     signal_lag: int,
     annualization_factor: int,
+    starting_capital: float,
     use_regime_filters: bool,
 ) -> None:
-    st.subheader("Backtesting Methodology Used")
+    st.subheader("Backtesting methodology")
     st.markdown(
         f"""
-        Each signal input is converted to a **rolling z-score**: today's value minus the mean of the prior
-        **{rolling_window} observations**, divided by their standard deviation. The rolling reference
-        window is shifted by one row, so today's observation is never included in its own benchmark.
-        When a rule crosses its threshold, the engine enters after **{signal_lag} trading day(s)**,
-        holds for **{holding_period} trading day(s)**, and exits. A rule that remains true on consecutive
-        dates launches a separate, potentially overlapping trade on each date.
+        The backtest follows four steps:
+
+        1. Calculate a market feature.
+        2. Convert the feature to a rolling z-score.
+        3. Use the crossing direction that matches the trade idea.
+        4. Enter after **{signal_lag} trading day(s)** and exit after **{holding_period} trading day(s)**.
         """
     )
 
-    st.subheader("Signal input features")
-    st.caption("These variables generate candidate trades after being standardized into rolling z-scores.")
+    st.subheader("1. Features and z-scores")
+    st.markdown(
+        fr"""
+        Every feature is compared with its previous **{rolling_window} observations**:
+
+        $$z_t = \frac{{x_t - \mu_{{t-1}}}}{{\sigma_{{t-1}}}}$$
+
+        - $x_t$ is the feature value today.
+        - $\mu_{{t-1}}$ and $\sigma_{{t-1}}$ are the mean and standard deviation of the prior window.
+
+        Today's value is excluded from its own historical benchmark, which prevents look-ahead bias.
+        """
+    )
     signal_features = pd.DataFrame(
         [
-            ("10Y yield change — 5 days", "10Y yield today minus its level five trading rows earlier", "Momentum", "z_y10_change_5d"),
-            ("10Y yield change — 20 days", "10Y yield today minus its level 20 trading rows earlier", "Exhaustion / reversal", "z_y10_change_20d"),
-            ("2s10s spread", "10Y yield minus 2Y yield", "Curve steepener / flattener", "z_2s10s"),
-            ("5s30s spread", "30Y yield minus 5Y yield", "Long-end steepener / flattener", "z_5s30s"),
-            ("2s5s10s butterfly", "5Y yield minus the average of the 2Y and 10Y yields", "5Y relative-value butterfly", "z_butterfly"),
-            ("CPI surprise", "Released CPI actual minus the pre-release consensus forecast", "Directional duration", "z_cpi_surprise"),
-            ("Payroll surprise", "Released nonfarm-payroll actual minus the pre-release consensus forecast", "Directional duration", "z_nfp_surprise"),
+            ("10Y yield change — 5 days", "10Y(t) − 10Y(t−5)", "Momentum", "z_y10_change_5d"),
+            ("10Y yield change — 20 days", "10Y(t) − 10Y(t−20)", "Reversal", "z_y10_change_20d"),
+            ("2s10s spread", "10Y − 2Y", "Curve", "z_2s10s"),
+            ("5s30s spread", "30Y − 5Y", "Curve", "z_5s30s"),
+            ("2s5s10s butterfly", "5Y − (2Y + 10Y) ÷ 2", "Butterfly", "z_butterfly"),
+            ("CPI surprise", "Actual CPI − expected CPI", "Macro surprise", "z_cpi_surprise"),
+            ("Payroll surprise", "Actual payrolls − expected payrolls", "Macro surprise", "z_nfp_surprise"),
         ],
-        columns=["Feature", "Raw definition", "Used for", "Model field"],
+        columns=["Feature", "Formula", "Used for", "Model field"],
     )
     signal_features["Data status"] = signal_features["Model field"].map(
         lambda field: "Available" if field in result.frame.columns else "Missing"
     )
     st.dataframe(signal_features, hide_index=True, width="stretch")
 
-    st.subheader("Regime filters")
+    st.subheader("2. Signal and entry rules")
     st.markdown(
-        """
-        A **regime filter is a second-stage check on a candidate trade**. The signal feature and threshold
-        decide whether a trade idea exists; the regime filter then asks whether the broader market backdrop
-        strongly contradicts that idea. It never creates a trade by itself.
+        f"""
+        The approach of this backtester relies mainly on statistical deviations from recent history rather than a full
+        fundamental valuation model. This is a limitation because a large z-score shows that a move is unusual,
+        but does not prove that it will continue or reverse.
 
-        The process is: **signal threshold fires → candidate trade is created → regime evidence is checked →
-        accepted candidates are executed after the entry lag**. This implementation is a conflict veto:
-        neutral or unavailable regime data allows the candidate through, while clearly opposing evidence
-        rejects it.
+        - The rules are grouped into two approaches:
+          - **Momentum** (use **±1 SD** threshold and trigger when the threshold is first crossed)
+            - **Directional yield:** 5-day changes in the 10Y yield
+          - **Mean Reversion** (use **±2 SD** threshold for more abnormal market deviation, and trigger when reading crosses back in)
+            - **Directional yield:** 20-day yield reversal.
+            - **Curve:** 2s10s and 5s30s normalization.
+            - **Butterfly:** 5Y relative value against the 2Y and 10Y yields.
+        - The **{rolling_window}-day** lookback gives approximately one trading year of recent history.
+        - The **{signal_lag}-day** entry lag prevents same-day execution on the signal. The common
+        **{holding_period}-day** holding period provides a consistent short-term comparison across signals.
+
+        These choices are simple and explainable, but they were not optimized or independently validated.
+        """
+    )
+    st.dataframe(
+        _signal_dictionary(result),
+        hide_index=True,
+        width="stretch",
+        height=560,
+        column_config={"Events": st.column_config.NumberColumn(format="%d")},
+    )
+
+    st.subheader("3. Market Regime Filter")
+    st.markdown(
+        r"""
+        The Market Regime Filter can reject a candidate, but it cannot create a trade.
+
+        $$\text{Yield-Direction Score} = \text{upward-yield votes} - \text{downward-yield votes}$$
+
+        - A score of **+2 or higher** suggests rising yields, so a **long Treasury trade is rejected**.
+        - A score of **−2 or lower** suggests falling yields, so a **short Treasury trade is rejected**.
+        - Scores from **−1 to +1** do not reject a trade.
         """
     )
     if not use_regime_filters:
-        st.warning("Regime filtering is disabled; every candidate signal proceeds to execution when enough future data exist.")
+        st.warning("The Market Regime Filter is disabled; every candidate signal proceeds to execution when enough future data exist.")
 
+    filter_structure = pd.DataFrame(
+        [
+            (
+                "Market votes",
+                "SPY, VIX, credit, dollar and inflation",
+                "Whether the broader market favors yields rising or falling",
+                "Long or short Treasury trades",
+            ),
+            (
+                "Nelson–Siegel",
+                "Treasury yield-curve level, slope and curvature",
+                "Whether the level or shape of the Treasury curve supports the signal",
+                "10Y, curve and butterfly trades",
+            ),
+        ],
+        columns=["Check", "Inputs", "What it tells us", "Applied to"],
+    )
+    st.dataframe(filter_structure, hide_index=True, width="stretch")
+
+    st.markdown(
+        """
+        We interpret market conditions from two different sources - external market indicators and the yield curve:
+        - External market indicators show broader risk, credit and inflation conditions.
+        - Treasury yield curve shows how interest-rate expectations differ across maturities.
+
+        Market votes are used to assess long and short Treasury trades. For Nelson-Siegel, we use level for 10Y yield trades, slope for curve trades, and curvature for butterfly trades. A Nelson–Siegel check rejects a
+        trade only when the relevant factor is at least one standard deviation from normal and points against the signal.
+        """
+    )
+
+    st.markdown("**Detailed input rules**")
     regime_inputs = pd.DataFrame(
         [
-            ("SPY", "5-day return ≥ +1% is risk-on; ≤ −1% is risk-off", "Directional duration", "spy_return_5d"),
-            ("VIX", "5-day change ≤ −1 is risk-on; ≥ +1 is risk-off", "Directional duration", "vix_change_5d"),
-            ("HY credit spread", "5-day tightening ≥ 5 bp is risk-on; widening ≥ 5 bp is risk-off", "Directional duration", "hy_oas_change_5d_bp"),
-            ("IG credit spread", "5-day tightening ≥ 5 bp is risk-on; widening ≥ 5 bp is risk-off", "Directional duration", "ig_oas_change_5d_bp"),
-            ("Broad dollar", "5-day return ≤ −0.5% is risk-on; ≥ +0.5% is risk-off", "Directional duration", "broad_dollar_return_5d"),
-            ("Inflation breakevens", "Each 5-day move ≥ +0.05 points votes yields up; ≤ −0.05 votes yields down", "Directional duration", "inflation_regime_score"),
-            ("Nelson–Siegel level", "An opposing z-score with magnitude ≥ 1 vetoes the yield-move signal", "Momentum and exhaustion", "z_ns_level"),
+            ("SPY", "5-day return ≥ +1% is risk-on; ≤ −1% is risk-off", "Directional Treasury trades", "spy_return_5d"),
+            ("VIX", "5-day change ≤ −1 is risk-on; ≥ +1 is risk-off", "Directional Treasury trades", "vix_change_5d"),
+            ("HY credit spread", "5-day tightening ≥ 5 bp is risk-on; widening ≥ 5 bp is risk-off", "Directional Treasury trades", "hy_oas_change_5d_bp"),
+            ("IG credit spread", "5-day tightening ≥ 5 bp is risk-on; widening ≥ 5 bp is risk-off", "Directional Treasury trades", "ig_oas_change_5d_bp"),
+            ("Broad dollar", "5-day return ≤ −0.5% is risk-on; ≥ +0.5% is risk-off", "Directional Treasury trades", "broad_dollar_return_5d"),
+            ("Inflation breakevens", "Each 5-day move ≥ +0.05 points votes yields up; ≤ −0.05 votes yields down", "Directional Treasury trades", "inflation_regime_score"),
+            ("Nelson–Siegel level", "An opposing z-score with magnitude ≥ 1 vetoes the yield-move signal", "Directional yield momentum and reversal", "z_ns_level"),
             ("Nelson–Siegel slope", "An opposing z-score with magnitude ≥ 1 vetoes the curve signal", "Curve trades", "z_ns_slope"),
             ("Nelson–Siegel curvature", "An opposing z-score with magnitude ≥ 1 vetoes the butterfly signal", "Butterfly trades", "z_ns_curvature"),
         ],
@@ -522,51 +621,80 @@ def _render_methodology(
     )
     st.dataframe(regime_inputs, hide_index=True, width="stretch")
 
-    st.subheader("Signal rules and resulting trades")
-    st.caption(
-        "Available means the required feature exists in the loaded dataset. Missing macro surprise inputs cannot fire. "
-        "Events counts every date on which the rule is true."
+    st.subheader("4. Position sizing and P&L")
+    completed_trade_types = {
+        str(trade.metadata.get("trade_type", "")) for trade in result.trades
+    }
+    positioning_summary = pd.DataFrame(
+        [
+            (
+                "Outright 10Y",
+                "1",
+                "Long or short 10Y",
+                "Full notional in one leg",
+                "Movement in the 10Y yield",
+                "Yes" if any("momentum" in trade_type or "reversal" in trade_type for trade_type in completed_trade_types) else "No",
+            ),
+            (
+                "2s10s curve",
+                "2",
+                "2Y and 10Y in opposite directions",
+                "Legs weighted using duration",
+                "Change in the 2s10s spread",
+                "Yes" if any(trade_type.startswith("2s10s_") for trade_type in completed_trade_types) else "No",
+            ),
+            (
+                "5s30s curve",
+                "2",
+                "5Y and 30Y in opposite directions",
+                "Legs weighted using duration",
+                "Change in the 5s30s spread",
+                "Yes" if any(trade_type.startswith("5s30s_") for trade_type in completed_trade_types) else "No",
+            ),
+            (
+                "2s5s10s butterfly",
+                "3",
+                "5Y belly against the 2Y and 10Y wings",
+                "Belly and wings weighted using duration",
+                "5Y movement relative to the wings",
+                "Yes" if any("butterfly" in trade_type for trade_type in completed_trade_types) else "No",
+            ),
+        ],
+        columns=[
+            "Trade structure",
+            "Legs",
+            "Position structure",
+            "Sizing approach",
+            "P&L driver",
+            "Used in current results",
+        ],
     )
-    st.dataframe(
-        _signal_dictionary(result),
-        hide_index=True,
-        width="stretch",
-        height=560,
-        column_config={"Events": st.column_config.NumberColumn(format="%d")},
-    )
+    st.dataframe(positioning_summary, hide_index=True, width="stretch")
 
-    st.subheader("Position sizing and P&L")
-    st.markdown(
-        """
-        The selected gross notional is divided among a trade's legs so the absolute weights sum to 100%.
-        Curve and butterfly templates use duration estimates to offset first-order duration exposure across
-        their legs. Outright positions and the equal-notional 2Y/10Y macro trades are directional and are
-        **not generally duration-neutral**.
-
-        For each leg, approximate P&L is `−notional × signed weight × duration × yield change`, with the
-        yield change converted from percentage points to decimals. Long bonds therefore profit when yields
-        fall; short bonds profit when yields rise. The calculation excludes carry, roll-down, convexity,
-        financing, bid/ask spreads, fees, and slippage.
-        """
-    )
-
-    st.subheader("Performance metrics")
+    st.subheader("5. Performance metrics")
     metrics = pd.DataFrame(
         [
-            ("Cumulative P&L", "Sum of approximate dollar P&L across completed trades."),
+            ("Starting Capital", _money(starting_capital)),
+            ("Cumulative P&L", "Sum of daily mark-to-market P&L"),
+            ("Cumulative return", "Ending portfolio value ÷ starting capital − 1"),
             (
-                "Sharpe ratio",
-                f"Mean daily realized P&L ÷ population standard deviation of daily realized P&L × √{annualization_factor}. Days are grouped by trade exit date; this is not a return-based or mark-to-market Sharpe.",
+                "Annualized Sharpe",
+                f"mean(daily portfolio return) ÷ std(daily portfolio return) × √{annualization_factor}",
             ),
-            ("Maximum drawdown", "Largest peak-to-trough fall in cumulative realized P&L, measured from a zero initial baseline."),
-            ("Win rate", "Completed winning trades ÷ all completed trades. A flat trade is not a win."),
-            ("Profit factor", "Total P&L on winners ÷ absolute total P&L on losers. Above 1 means gross winners exceed gross losers."),
-            ("Average winner / loser", "Mean P&L conditional on a trade finishing positive / negative."),
-            ("Trade count", "Number of completed signal instances, not the number of unique signal types or non-overlapping positions."),
+            ("Maximum drawdown", "Largest decline in daily portfolio value from a previous peak"),
+            ("Win rate", "Winning trades ÷ completed trades"),
+            ("Profit factor", "Total winning P&L ÷ |total losing P&L|"),
+            ("Average winner / loser", "Mean P&L of winning trades / losing trades"),
+            ("Trade count", "Completed trades after the overlap and cooldown rules"),
         ],
-        columns=["Metric", "Definition"],
+        columns=["Metric", "Formula or definition"],
     )
     st.dataframe(metrics, hide_index=True, width="stretch")
+    st.caption(
+        "Open trades are revalued each trading day using duration and daily yield changes. Daily return is "
+        "daily P&L divided by the previous portfolio value. The risk-free rate is set to zero; transaction "
+        "costs, carry and convexity are excluded."
+    )
 
 
 def _render_trades(result: BacktestRun) -> None:
@@ -575,12 +703,12 @@ def _render_trades(result: BacktestRun) -> None:
         st.info("No trades completed for the selected configuration.")
         return
     st.subheader("Completed accepted-trade log")
-    st.caption("Only candidates accepted by the selected regime-filter mode can appear here.")
+    st.caption("Only candidates accepted by the selected Market Regime Filter mode can appear here.")
     signals = st.multiselect("Signal", sorted(trades["Signal"].unique()), key="trade_signals")
     outcomes = st.multiselect("Outcome", ["Win", "Loss", "Flat"], key="trade_outcomes")
     filter_types = st.multiselect(
-        "Regime filter type",
-        sorted(trades["Regime filter"].unique()),
+        "Market Regime Filter type",
+        sorted(trades["Market Regime Filter"].unique()),
         key="trade_filter_types",
     )
     visible = trades
@@ -589,7 +717,7 @@ def _render_trades(result: BacktestRun) -> None:
     if outcomes:
         visible = visible[visible["Result"].isin(outcomes)]
     if filter_types:
-        visible = visible[visible["Regime filter"].isin(filter_types)]
+        visible = visible[visible["Market Regime Filter"].isin(filter_types)]
     st.caption(f"Showing {len(visible):,} of {len(trades):,} completed trades")
     st.dataframe(
         visible.sort_values("Entry", ascending=False),
@@ -615,14 +743,14 @@ def _render_curve(result: BacktestRun) -> None:
         factors = result.frame[[column for column in ("ns_level", "ns_slope", "ns_curvature") if column in result.frame]]
         st.line_chart(factors, height=320)
 
-    st.subheader("Regime-filter diagnostics")
+    st.subheader("Market Regime Filter diagnostics")
     st.caption(
-        "Positive duration-regime values favor rising yields and short-duration trades; negative values favor "
-        "falling yields and long-duration trades. Zero is neutral."
+        "A positive Yield-Direction Score favors rising yields; a negative score favors falling yields. "
+        "Zero is neutral."
     )
     regime_columns = [
         column
-        for column in ("risk_regime_score", "inflation_regime_score", "duration_regime_score")
+        for column in ("risk_regime_score", "inflation_regime_score", "yield_direction_score")
         if column in result.frame
     ]
     shape_columns = [
@@ -657,6 +785,8 @@ def _page_style() -> None:
         .period-strip b { color: #f4f7fb; margin-right: .45rem; }
         [data-testid="stMetric"] { background: #0d1929; border: 1px solid #20314a; padding: 1rem; border-radius: 10px; }
         [data-testid="stMetricValue"] { font-variant-numeric: tabular-nums; }
+        .st-key-headline_metrics [data-testid="stHorizontalBlock"] { flex-wrap: nowrap; overflow-x: auto; padding-bottom: .55rem; }
+        .st-key-headline_metrics [data-testid="column"] { min-width: 185px; flex: 0 0 185px; }
         h1, h2, h3 { letter-spacing: -.025em; }
         div[data-baseweb="tab-list"] { gap: .4rem; }
         button[data-baseweb="tab"] { background: #0d1929; border-radius: 8px; padding: .55rem .9rem; }
@@ -674,6 +804,15 @@ def main() -> None:
         st.markdown("## Backtest controls")
         data_path = str(REPOSITORY_ROOT)
         st.caption("Dataset: bundled Treasury Yield and Risk Sentiment CSV files")
+        starting_capital = st.number_input(
+            "Starting Capital",
+            min_value=100_000.0,
+            max_value=1_000_000_000.0,
+            value=10_000_000.0,
+            step=1_000_000.0,
+            format="%.0f",
+            help="The value of the portfolio at the beginning of the backtest. It is used to convert daily P&L into daily returns.",
+        )
         rolling_window = st.number_input("Rolling lookback", min_value=20, max_value=1000, value=252, step=21)
         holding_period = st.number_input("Holding period (trading days)", min_value=1, max_value=60, value=5)
         signal_lag = st.number_input("Entry lag (trading days)", min_value=0, max_value=10, value=1)
@@ -685,16 +824,43 @@ def main() -> None:
             step=100_000.0,
             format="%.0f",
         )
-        annualization_factor = st.number_input("Sharpe annualization", min_value=1, max_value=365, value=252)
+        annualization_factor = 252
+        cooldown_period = st.number_input(
+            "Post-exit cooldown (trading days)",
+            min_value=0,
+            max_value=60,
+            value=5,
+            help=(
+                "The number of trading days a signal must wait after its previous trade closes "
+                "before it can open another trade. Other signals can still trade during this period."
+            ),
+        )
+        fresh_crossings_only = st.checkbox(
+            "New threshold crossings only",
+            value=True,
+            help=(
+                "For momentum and macro signals, an existing threshold breach cannot trigger again. "
+                "It must first move back inside the threshold and then cross outward again. "
+                "Yield-reversal, curve and butterfly signals always wait for a crossing back inside."
+            ),
+        )
+        one_active_trade_per_signal = st.checkbox(
+            "One active trade per signal",
+            value=True,
+            help=(
+                "The same signal cannot open a new trade while its previous trade is still active. "
+                "Other signals can still open trades."
+            ),
+        )
         use_regime_filters = st.checkbox(
-            "Use regime filters",
+            "Use Market Regime Filter",
             value=True,
             help="Veto signals that conflict with available market context or Nelson–Siegel curve factors.",
         )
         if st.button("Refresh backtest", type="primary", width="stretch"):
             _run_cached.clear()
         st.divider()
-        st.caption("Signals use historical rolling statistics and enter after the configured lag. Repeated signals can create overlapping positions. Regime filters veto conflicts but do not create trades.")
+        st.caption("Signals use lag-safe rolling statistics. New threshold crossings, active-position limits and cooldowns prevent repeated exposure.")
 
     try:
         with st.spinner("Running filtered and unfiltered Treasury strategies…"):
@@ -705,7 +871,11 @@ def main() -> None:
                 int(signal_lag),
                 int(annualization_factor),
                 float(gross_notional),
+                float(starting_capital),
                 True,
+                bool(fresh_crossings_only),
+                bool(one_active_trade_per_signal),
+                int(cooldown_period),
             )
             unfiltered_result = _run_cached(
                 data_path,
@@ -714,7 +884,11 @@ def main() -> None:
                 int(signal_lag),
                 int(annualization_factor),
                 float(gross_notional),
+                float(starting_capital),
                 False,
+                bool(fresh_crossings_only),
+                bool(one_active_trade_per_signal),
+                int(cooldown_period),
             )
     except Exception as exc:  # noqa: BLE001
         st.error(f"Backtest could not run: {exc}")
@@ -736,6 +910,7 @@ def main() -> None:
             holding_period=int(holding_period),
             signal_lag=int(signal_lag),
             annualization_factor=int(annualization_factor),
+            starting_capital=float(starting_capital),
             use_regime_filters=bool(use_regime_filters),
         )
     with overview:

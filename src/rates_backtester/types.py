@@ -26,7 +26,11 @@ class BacktestConfig:
     signal_lag: int = 1
     annualization_factor: int = 252
     gross_notional: float = 1_000_000.0
+    starting_capital: float = 10_000_000.0
     use_regime_filters: bool = True
+    fresh_crossings_only: bool = True
+    one_active_trade_per_signal: bool = True
+    cooldown_period: int = 5
 
 
 @dataclass(frozen=True)

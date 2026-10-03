@@ -73,19 +73,44 @@ def test_all_required_metrics_exist():
 def test_all_required_signals_exist():
     frame = pd.DataFrame(
         {
-            "z_cpi_surprise": [-1.5, 1.5],
-            "z_nfp_surprise": [-1.5, 1.5],
-            "z_y10_change_5d": [-1.25, 1.25],
-            "z_y10_change_20d": [-2.5, 2.5],
-            "z_2s10s": [-2.5, 2.5],
-            "z_5s30s": [-2.5, 2.5],
-            "z_butterfly": [-2.5, 2.5],
+            "z_cpi_surprise": [0.0, -1.5, 0.0, 1.5, 0.0],
+            "z_nfp_surprise": [0.0, -1.5, 0.0, 1.5, 0.0],
+            "z_y10_change_5d": [0.0, -1.25, 0.0, 1.25, 0.0],
+            "z_y10_change_20d": [0.0, -2.5, -1.5, 2.5, 1.5],
+            "z_2s10s": [0.0, -2.5, -1.5, 2.5, 1.5],
+            "z_5s30s": [0.0, -2.5, -1.5, 2.5, 1.5],
+            "z_butterfly": [0.0, -2.5, -1.5, 2.5, 1.5],
         },
-        index=pd.to_datetime(["2024-01-04", "2024-01-05"]),
+        index=pd.date_range("2024-01-01", periods=5, freq="B"),
     )
     events = generate_signal_events(frame)
     assert {event.signal_name for event in events} == EXPECTED_SIGNALS
     assert all(event.interpretation for event in events)
+
+
+def test_fresh_crossing_mode_does_not_repeat_persistent_signal():
+    frame = pd.DataFrame(
+        {"z_cpi_surprise": [0.0, 1.5, 1.7, 0.0, 1.6]},
+        index=pd.date_range("2024-01-01", periods=5, freq="B"),
+    )
+
+    fresh = generate_signal_events(frame)
+    repeated = generate_signal_events(frame, fresh_crossings_only=False)
+
+    assert [event.date for event in fresh] == [frame.index[1], frame.index[4]]
+    assert len(repeated) == 3
+
+
+def test_mean_reversion_signal_waits_for_reentry_inside_threshold():
+    frame = pd.DataFrame(
+        {"z_2s10s": [0.0, -2.5, -2.2, -1.8]},
+        index=pd.date_range("2024-01-01", periods=4, freq="B"),
+    )
+
+    events = generate_signal_events(frame)
+
+    assert [event.signal_name for event in events] == ["curve_too_flat"]
+    assert events[0].date == frame.index[3]
 
 
 def test_all_required_mappings_exist():
@@ -108,8 +133,8 @@ def test_curve_trade_leg_directions():
     assert [(leg.tenor, leg.side) for leg in weak_payrolls.legs] == [("2Y", "long"), ("10Y", "long")]
     assert [(leg.tenor, leg.side) for leg in steepener.legs] == [("2Y", "long"), ("10Y", "short")]
     assert [(leg.tenor, leg.side) for leg in flattener.legs] == [("2Y", "short"), ("10Y", "long")]
-    assert [(leg.tenor, leg.side) for leg in long_end_steepener.legs] == [("5Y", "short"), ("30Y", "long")]
-    assert [(leg.tenor, leg.side) for leg in long_end_flattener.legs] == [("5Y", "long"), ("30Y", "short")]
+    assert [(leg.tenor, leg.side) for leg in long_end_steepener.legs] == [("5Y", "long"), ("30Y", "short")]
+    assert [(leg.tenor, leg.side) for leg in long_end_flattener.legs] == [("5Y", "short"), ("30Y", "long")]
 
 
 def test_butterfly_trade_leg_directions():
